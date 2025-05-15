@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import aiohttp
 import datetime
 from functools import wraps
 from pyrogram import filters
@@ -288,43 +289,52 @@ async def buy_numbers(client, message: Message):
 
     buttons = [
         [
-            InlineKeyboardButton("✘《 Yes ↯ 》", callback_data="buy_custom"),
-            InlineKeyboardButton("✘《 No ↯ 》", callback_data="buy_all")
+            InlineKeyboardButton("US 🇺🇸", callback_data="country_US"),
+            InlineKeyboardButton("CA 🇨🇦", callback_data="country_CA")
+        ],
+        [
+            InlineKeyboardButton("PR 🇵🇷", callback_data="country_PR")
         ]
     ]
     await client.send_message(
         message.chat.id,
-        "**Do you want to choose a custom number?**",
+        "**✘《 Kindly Choose The Country You Prefer ↯ 》**",
         reply_markup=InlineKeyboardMarkup(buttons),
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def fetch_numbers(client, message: Message, user_id, custom_prefix=None):
-    loading_message = await client.send_message(message.chat.id, "**✘《 Loading ↯ 》 Fetching Puerto Rico numbers...**", parse_mode=ParseMode.MARKDOWN)
+async def fetch_numbers(client, message: Message, user_id, country_code, custom_prefix=None):
+    loading_message = await client.send_message(message.chat.id, f"**✘《 Loading ↯ 》 Fetching {country_code} numbers...**", parse_mode=ParseMode.MARKDOWN)
 
     sid, token = twilio_users[user_id]
     headers = {
         "Authorization": "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode()
     }
 
-    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/AvailablePhoneNumbers/PR/Local.json?PageSize=10"
+    url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/AvailablePhoneNumbers/{country_code}/Local.json?PageSize=10"
     if custom_prefix:
-        url += f"&AreaCode={custom_prefix}"
+        if country_code == "PR":
+            url += f"&AreaCode=787{custom_prefix}"
+        else:
+            url += f"&AreaCode={custom_prefix}"
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             if resp.status != 200:
-                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Failed to fetch numbers**", parse_mode=ParseMode.MARKDOWN)
+                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 Failed to fetch {country_code} numbers**", parse_mode=ParseMode.MARKDOWN)
                 return
 
             data = await resp.json()
             numbers = data.get("available_phone_numbers", [])
+            if country_code == "CA":
+                numbers = [num for num in numbers if num['phone_number'].startswith('+1')]
+            
             if not numbers:
-                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 No available Puerto Rico numbers**", parse_mode=ParseMode.MARKDOWN)
+                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 No available {country_code} numbers**", parse_mode=ParseMode.MARKDOWN)
                 return
 
             numbers_list = "\n".join(num['phone_number'] for num in numbers)
-            message_text = f"**Available Puerto Rico Numbers:**\n{numbers_list}\n\n**Select a number to purchase:**"
+            message_text = f"**Available {country_code} Numbers:**\n{numbers_list}\n\n**Select a number to purchase:**"
 
             buttons = []
             row = []
@@ -355,7 +365,15 @@ async def handle_custom_area_code(client, message: Message):
         return
 
     area_code = message.text
-    await fetch_numbers(client, message, user_id, custom_prefix=area_code)
+    # Get the country code from the callback query context (stored in reply_to_message)
+    if message.reply_to_message and message.reply_to_message.reply_markup:
+        for row in message.reply_to_message.reply_markup.inline_keyboard:
+            for button in row:
+                if button.callback_data.startswith("custom_"):
+                    country_code = button.callback_data.split("_")[1]
+                    await fetch_numbers(client, message, user_id, country_code, custom_prefix=area_code)
+                    return
+    await client.send_message(message.chat.id, "**✘《 Error ↯ 》 Please select a country first**", parse_mode=ParseMode.MARKDOWN)
 
 @bot.on_callback_query()
 async def handle_callbacks(client, callback_query: CallbackQuery):
@@ -365,10 +383,27 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
         return
 
     data = callback_query.data
-    if data == "buy_all":
-        await fetch_numbers(client, callback_query.message, user_id)
-    elif data == "buy_custom":
-        await callback_query.message.reply("**Enter your preferred 3-digit area code (e.g., 592):**", parse_mode=ParseMode.MARKDOWN)
+    if data.startswith("country_"):
+        country_code = data.split("_")[1]
+        buttons = [
+            [
+                InlineKeyboardButton("✘《 Yes ↯ 》", callback_data=f"custom_{country_code}"),
+                InlineKeyboardButton("✘《 No ↯ 》", callback_data=f"all_{country_code}")
+            ]
+        ]
+        await client.edit_message_text(
+            callback_query.message.chat.id,
+            callback_query.message.id,
+            "**✘《 Do You Prefer Custom Area Code ↯ 》**",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif data.startswith("all_"):
+        country_code = data.split("_")[1]
+        await fetch_numbers(client, callback_query.message, user_id, country_code)
+    elif data.startswith("custom_"):
+        country_code = data.split("_")[1]
+        await callback_query.message.reply(f"**Enter your preferred 3-digit area code for {country_code} (e.g., 592):**", parse_mode=ParseMode.MARKDOWN)
     elif data.startswith("buy_"):
         phone = data.replace("buy_", "")
         sid, token = twilio_users[user_id]
