@@ -313,8 +313,9 @@ async def fetch_numbers(client, message: Message, user_id, country_code, custom_
 
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/AvailablePhoneNumbers/{country_code}/Local.json?PageSize=10"
     if custom_prefix:
+        # For Puerto Rico, prefix with 787 as per original logic
         if country_code == "PR":
-            url += f"&AreaCode=787{custom_prefix}"
+            url += f"&AreaCode=787"
         else:
             url += f"&AreaCode={custom_prefix}"
 
@@ -333,8 +334,18 @@ async def fetch_numbers(client, message: Message, user_id, country_code, custom_
                 await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 No available {country_code} numbers**", parse_mode=ParseMode.MARKDOWN)
                 return
 
+            # Filter numbers by custom prefix if provided
+            if custom_prefix and country_code != "PR":
+                numbers = [num for num in numbers if num['phone_number'].startswith(f'+1{custom_prefix}')]
+            elif custom_prefix and country_code == "PR":
+                numbers = [num for num in numbers if num['phone_number'].startswith(f'+1787')]
+
+            if not numbers:
+                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 No available {country_code} numbers with area code {custom_prefix}**", parse_mode=ParseMode.MARKDOWN)
+                return
+
             numbers_list = "\n".join(num['phone_number'] for num in numbers)
-            message_text = f"**Available {country_code} Numbers:**\n{numbers_list}\n\n**Select a number to purchase:**"
+            message_text = f"**Available {country_code} Numbers{' with area code ' + custom_prefix if custom_prefix else ''}:**\n{numbers_list}\n\n**Select a number to purchase:**"
 
             buttons = []
             row = []
@@ -365,15 +376,14 @@ async def handle_custom_area_code(client, message: Message):
         return
 
     area_code = message.text
-    # Get the country code from the callback query context (stored in reply_to_message)
-    if message.reply_to_message and message.reply_to_message.reply_markup:
-        for row in message.reply_to_message.reply_markup.inline_keyboard:
-            for button in row:
-                if button.callback_data.startswith("custom_"):
-                    country_code = button.callback_data.split("_")[1]
-                    await fetch_numbers(client, message, user_id, country_code, custom_prefix=area_code)
-                    return
-    await client.send_message(message.chat.id, "**✘《 Error ↯ 》 Please select a country first**", parse_mode=ParseMode.MARKDOWN)
+    # Get the country code from the replied message
+    if message.reply_to_message and message.reply_to_message.text:
+        # Extract country code from the prompt message
+        if "Enter your preferred 3-digit area code for" in message.reply_to_message.text:
+            country_code = message.reply_to_message.text.split("for ")[-1].split(" ")[0]
+            await fetch_numbers(client, message, user_id, country_code, custom_prefix=area_code)
+            return
+    await client.send_message(message.chat.id, "**✘《 Error ↯ 》 Please select a country first and reply to the area code prompt**", parse_mode=ParseMode.MARKDOWN)
 
 @bot.on_callback_query()
 async def handle_callbacks(client, callback_query: CallbackQuery):
