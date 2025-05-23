@@ -13,7 +13,8 @@ from pyrogram.types import (
 from pyrogram.enums import ParseMode
 from pyrogram.errors import (
     UserIdInvalid,
-    UsernameNotOccupied
+    UsernameNotOccupied,
+    MessageNotModified
 )
 from pymongo.errors import ConnectionFailure
 from config import ADMIN_IDS
@@ -255,15 +256,27 @@ async def login(client, message: Message):
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"https://api.twilio.com/2010-04-01/Accounts/{sid}.json", headers=headers) as resp:
-            if resp.status == 200:
-                twilio_users[message.from_user.id] = (sid, token)
-                twilio_numbers.setdefault(message.from_user.id, [])
-                save_user(message.from_user.id, sid, token)
-                save_numbers(message.from_user.id, twilio_numbers[message.from_user.id])
-                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Success ↯ 》 Login successful**", parse_mode=ParseMode.MARKDOWN)
-            else:
-                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Login failed. Check your SID/TOKEN**", parse_mode=ParseMode.MARKDOWN)
+        try:
+            async with session.get(f"https://api.twilio.com/2010-04-01/Accounts/{sid}.json", headers=headers) as resp:
+                response_text = await resp.text()
+                LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Login API response for user_id {message.from_user.id}: Status {resp.status}, Response {response_text}")
+                if resp.status == 200:
+                    twilio_users[message.from_user.id] = (sid, token)
+                    twilio_numbers.setdefault(message.from_user.id, [])
+                    save_user(message.from_user.id, sid, token)
+                    save_numbers(message.from_user.id, twilio_numbers[message.from_user.id])
+                    await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Success ↯ 》 Login successful**", parse_mode=ParseMode.MARKDOWN)
+                else:
+                    error_message = f"**✘《 Error ↯ 》 Login failed. Check your SID/TOKEN.**\nDetails: HTTP {resp.status}"
+                    try:
+                        error_data = await resp.json()
+                        error_message += f" - {error_data.get('message', 'Unknown error')}"
+                    except ValueError:
+                        error_message += f" - {response_text}"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+        except aiohttp.ClientError as e:
+            LOGGER.error(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - Network error during login for user_id {message.from_user.id}: {str(e)}")
+            await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Network error during login. Please try again.**", parse_mode=ParseMode.MARKDOWN)
 
 @bot.on_message(filters.command("logout"))
 @restrict_to_authorized
@@ -313,59 +326,84 @@ async def fetch_numbers(client, message: Message, user_id, country_code, custom_
 
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/AvailablePhoneNumbers/{country_code}/Local.json?PageSize=10"
     if custom_prefix:
-        # For Puerto Rico, prefix with 787 as per original logic
         if country_code == "PR":
             url += f"&AreaCode=787"
         else:
             url += f"&AreaCode={custom_prefix}"
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 Failed to fetch {country_code} numbers**", parse_mode=ParseMode.MARKDOWN)
-                return
+        try:
+            async with session.get(url, headers=headers) as resp:
+                response_text = await resp.text()
+                LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Fetch numbers API response for user_id {user_id}: Status {resp.status}, Response {response_text}")
+                if resp.status != 200:
+                    error_message = f"**✘《 Error ↯ 》 Failed to fetch {country_code} numbers.**\nDetails: HTTP {resp.status}"
+                    try:
+                        error_data = await resp.json()
+                        error_message += f" - {error_data.get('message', 'Unknown error')}"
+                    except ValueError:
+                        error_message += f" - {response_text}"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                    return
 
-            data = await resp.json()
-            numbers = data.get("available_phone_numbers", [])
-            if country_code == "CA":
-                numbers = [num for num in numbers if num['phone_number'].startswith('+1')]
-            
-            if not numbers:
-                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 No available {country_code} numbers**", parse_mode=ParseMode.MARKDOWN)
-                return
+                data = await resp.json()
+                numbers = data.get("available_phone_numbers", [])
+                if country_code == "CA":
+                    numbers = [num for num in numbers if num['phone_number'].startswith('+1')]
+                
+                if not numbers:
+                    error_message = f"**✘《 Error ↯ 》 No available {country_code} numbers{' with area code ' + custom_prefix if custom_prefix else ''}**"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                    return
 
-            # Filter numbers by custom prefix if provided
-            if custom_prefix and country_code != "PR":
-                numbers = [num for num in numbers if num['phone_number'].startswith(f'+1{custom_prefix}')]
-            elif custom_prefix and country_code == "PR":
-                numbers = [num for num in numbers if num['phone_number'].startswith(f'+1787')]
+                # Filter numbers by custom prefix if provided
+                if custom_prefix and country_code != "PR":
+                    numbers = [num for num in numbers if num['phone_number'].startswith(f'+1{custom_prefix}')]
+                elif custom_prefix and country_code == "PR":
+                    numbers = [num for num in numbers if num['phone_number'].startswith('+1787')]
 
-            if not numbers:
-                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 No available {country_code} numbers with area code {custom_prefix}**", parse_mode=ParseMode.MARKDOWN)
-                return
+                if not numbers:
+                    error_message = f"**✘《 Error ↯ 》 No available {country_code} numbers with area code {custom_prefix}**"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                    return
 
-            numbers_list = "\n".join(num['phone_number'] for num in numbers)
-            message_text = f"**Available {country_code} Numbers{' with area code ' + custom_prefix if custom_prefix else ''}:**\n{numbers_list}\n\n**Select a number to purchase:**"
+                # Filter out already owned numbers
+                owned_numbers = twilio_numbers.get(user_id, [])
+                numbers = [num for num in numbers if num['phone_number'] not in owned_numbers]
 
-            buttons = []
-            row = []
-            for i, num in enumerate(numbers):
-                phone = num['phone_number']
-                row.append(InlineKeyboardButton(phone, callback_data=f"buy_{phone}"))
-                if len(row) == 2:
+                if not numbers:
+                    error_message = f"**✘《 Error ↯ 》 All available {country_code} numbers{' with area code ' + custom_prefix if custom_prefix else ''} are already owned**"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                    return
+
+                numbers_list = "\n".join(num['phone_number'] for num in numbers)
+                message_text = f"**Available {country_code} Numbers{' with area code ' + custom_prefix if custom_prefix else ''}:**\n{numbers_list}\n\n**Select a number to purchase:**"
+
+                buttons = []
+                row = []
+                for i, num in enumerate(numbers):
+                    phone = num['phone_number']
+                    row.append(InlineKeyboardButton(phone, callback_data=f"buy_{phone}"))
+                    if len(row) == 2:
+                        buttons.append(row)
+                        row = []
+
+                if row:
                     buttons.append(row)
-                    row = []
 
-            if row:
-                buttons.append(row)
-
-            await client.edit_message_text(
-                message.chat.id,
-                loading_message.id,
-                message_text,
-                reply_markup=InlineKeyboardMarkup(buttons),
-                parse_mode=ParseMode.MARKDOWN
-            )
+                try:
+                    await client.edit_message_text(
+                        message.chat.id,
+                        loading_message.id,
+                        message_text,
+                        reply_markup=InlineKeyboardMarkup(buttons),
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except MessageNotModified:
+                    LOGGER.debug(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - DEBUG - Message not modified for fetch_numbers, user_id {user_id}")
+        except aiohttp.ClientError as e:
+            LOGGER.error(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - Network error during fetch_numbers for user_id {user_id}: {str(e)}")
+            await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Network error while fetching numbers. Please try again.**", parse_mode=ParseMode.MARKDOWN)
 
 @bot.on_message(filters.regex(r"^[0-9]{3}$") & filters.reply)
 @restrict_to_authorized
@@ -375,10 +413,8 @@ async def handle_custom_area_code(client, message: Message):
         await client.send_message(message.chat.id, "**✘《 Error ↯ 》 Log in first using /login**", parse_mode=ParseMode.MARKDOWN)
         return
 
-    area_code = message.text
-    # Get the country code from the replied message
+    area_code = message.text.strip()
     if message.reply_to_message and message.reply_to_message.text:
-        # Extract country code from the prompt message
         if "Enter your preferred 3-digit area code for" in message.reply_to_message.text:
             country_code = message.reply_to_message.text.split("for ")[-1].split(" ")[0]
             await fetch_numbers(client, message, user_id, country_code, custom_prefix=area_code)
@@ -401,24 +437,41 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
                 InlineKeyboardButton("✘《 No ↯ 》", callback_data=f"all_{country_code}")
             ]
         ]
-        await client.edit_message_text(
-            callback_query.message.chat.id,
-            callback_query.message.id,
-            "**✘《 Do You Prefer Custom Area Code ↯ 》**",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            parse_mode=ParseMode.MARKDOWN
-        )
+        try:
+            await client.edit_message_text(
+                callback_query.message.chat.id,
+                callback_query.message.id,
+                "**✘《 Do You Prefer Custom Area Code ↯ 》**",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except MessageNotModified:
+            LOGGER.debug(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - DEBUG - Message not modified for country selection, user_id {user_id}")
+        await callback_query.answer()
     elif data.startswith("all_"):
         country_code = data.split("_")[1]
         await fetch_numbers(client, callback_query.message, user_id, country_code)
+        await callback_query.answer()
     elif data.startswith("custom_"):
         country_code = data.split("_")[1]
-        await callback_query.message.reply(f"**Enter your preferred 3-digit area code for {country_code} (e.g., 592):**", parse_mode=ParseMode.MARKDOWN)
+        try:
+            await callback_query.message.reply(f"**Enter your preferred 3-digit area code for {country_code} (e.g., 592):**", parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            LOGGER.error(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - Failed to send area code prompt for user_id {user_id}: {str(e)}")
+            await client.send_message(callback_query.message.chat.id, "**✘《 Error ↯ 》 Failed to prompt for area code. Please try again.**", parse_mode=ParseMode.MARKDOWN)
+        await callback_query.answer()
     elif data.startswith("buy_"):
         phone = data.replace("buy_", "")
-        sid, token = twilio_users[user_id]
+        if phone in twilio_numbers.get(user_id, []):
+            await callback_query.answer(f"Number {phone} is already owned by you.", show_alert=True)
+            return
 
-        loading_message = await client.send_message(callback_query.message.chat.id, f"**✘《 Loading ↯ 》 Purchasing number `{phone}`...**", parse_mode=ParseMode.MARKDOWN)
+        sid, token = twilio_users[user_id]
+        loading_message = await client.send_message(
+            callback_query.message.chat.id,
+            f"**✘《 Loading ↯ 》 Purchasing number `{phone}`...**",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
         headers = {
             "Authorization": "Basic " + base64.b64encode(f"{sid}:{token}".encode()).decode(),
@@ -426,27 +479,56 @@ async def handle_callbacks(client, callback_query: CallbackQuery):
         }
 
         data = {
-            "PhoneNumber": phone
+            "PhoneNumber": phone,
+            "SmsEnabled": "true"  # Ensure SMS capability for OTP
         }
 
         async with aiohttp.ClientSession() as session:
-            async with session.post(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers.json", headers=headers, data=data) as resp:
-                if resp.status == 201:
-                    twilio_numbers[user_id].append(phone)
-                    save_numbers(user_id, twilio_numbers[user_id])
-                    await client.edit_message_text(
-                        callback_query.message.chat.id,
-                        loading_message.id,
-                        f"**✘《 Success ↯ 》 Number purchased: `{phone}`**",
-                        parse_mode=ParseMode.MARKDOWN
+            try:
+                async with session.post(
+                    f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers.json",
+                    headers=headers,
+                    data=data
+                ) as resp:
+                    response_text = await resp.text()
+                    LOGGER.info(
+                        f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - "
+                        f"Purchase number API response for user_id {user_id}: Status {resp.status}, Response {response_text}"
                     )
-                else:
-                    await client.edit_message_text(
-                        callback_query.message.chat.id,
-                        loading_message.id,
-                        f"**✘《 Error ↯ 》 Failed to purchase number: `{phone}`**",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    if resp.status == 201:
+                        twilio_numbers.setdefault(user_id, []).append(phone)
+                        save_numbers(user_id, twilio_numbers[user_id])
+                        await client.edit_message_text(
+                            callback_query.message.chat.id,
+                            loading_message.id,
+                            f"**✘《 Success ↯ 》 Number purchased: `{phone}`**",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                    else:
+                        error_message = f"**✘《 Error ↯ 》 Failed to purchase number: `{phone}`**"
+                        try:
+                            error_data = await resp.json()
+                            error_message += f"\nDetails: {error_data.get('message', 'Unknown error')}"
+                        except ValueError:
+                            error_message += f"\nDetails: HTTP {resp.status} - {response_text}"
+                        await client.edit_message_text(
+                            callback_query.message.chat.id,
+                            loading_message.id,
+                            error_message,
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+            except aiohttp.ClientError as e:
+                LOGGER.error(
+                    f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - "
+                    f"Network error during number purchase for user_id {user_id}: {str(e)}"
+                )
+                await client.edit_message_text(
+                    callback_query.message.chat.id,
+                    loading_message.id,
+                    f"**✘《 Error ↯ 》 Network error while purchasing `{phone}`. Please try again.**",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+        await callback_query.answer()
 
 @bot.on_message(filters.command("my"))
 @restrict_to_authorized
@@ -458,7 +540,10 @@ async def my_numbers(client, message: Message):
         await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 No numbers found**", parse_mode=ParseMode.MARKDOWN)
         return
     text = "**Your Active Numbers:**\n\n" + "\n".join(num for num in nums)
-    await client.edit_message_text(message.chat.id, loading_message.id, text, parse_mode=ParseMode.MARKDOWN)
+    try:
+        await client.edit_message_text(message.chat.id, loading_message.id, text, parse_mode=ParseMode.MARKDOWN)
+    except MessageNotModified:
+        LOGGER.debug(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - DEBUG - Message not modified for my_numbers, user_id {user_id}")
 
 @bot.on_message(filters.command("del"))
 @restrict_to_authorized
@@ -480,22 +565,46 @@ async def delete_number(client, message: Message):
     }
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers.json", headers=headers) as resp:
-            data = await resp.json()
-            for record in data.get("incoming_phone_numbers", []):
-                if record.get("phone_number") == number:
-                    sid_to_delete = record.get("sid")
-                    del_url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers/{sid_to_delete}.json"
-                    async with session.delete(del_url, headers=headers) as del_resp:
-                        if del_resp.status == 204:
-                            twilio_numbers[user_id].remove(number)
-                            save_numbers(user_id, twilio_numbers[user_id])
-                            await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Success ↯ 》 Number deleted: `{number}`**", parse_mode=ParseMode.MARKDOWN)
-                            return
-                        else:
-                            await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Error ↯ 》 Failed to delete number: `{number}`**", parse_mode=ParseMode.MARKDOWN)
-                            return
-            await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Number not found in your account**", parse_mode=ParseMode.MARKDOWN)
+        try:
+            async with session.get(f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers.json", headers=headers) as resp:
+                response_text = await resp.text()
+                LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Fetch incoming numbers API response for user_id {user_id}: Status {resp.status}, Response {response_text}")
+                if resp.status != 200:
+                    error_message = f"**✘《 Error ↯ 》 Failed to fetch numbers.**\nDetails: HTTP {resp.status}"
+                    try:
+                        error_data = await resp.json()
+                        error_message += f" - {error_data.get('message', 'Unknown error')}"
+                    except ValueError:
+                        error_message += f" - {response_text}"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                    return
+
+                data = await resp.json()
+                for record in data.get("incoming_phone_numbers", []):
+                    if record.get("phone_number") == number:
+                        sid_to_delete = record.get("sid")
+                        del_url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/IncomingPhoneNumbers/{sid_to_delete}.json"
+                        async with session.delete(del_url, headers=headers) as del_resp:
+                            del_response_text = await del_resp.text()
+                            LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Delete number API response for user_id {user_id}: Status {del_resp.status}, Response {del_response_text}")
+                            if del_resp.status == 204:
+                                twilio_numbers[user_id].remove(number)
+                                save_numbers(user_id, twilio_numbers[user_id])
+                                await client.edit_message_text(message.chat.id, loading_message.id, f"**✘《 Success ↯ 》 Number deleted: `{number}`**", parse_mode=ParseMode.MARKDOWN)
+                                return
+                            else:
+                                error_message = f"**✘《 Error ↯ 》 Failed to delete number: `{number}`**"
+                                try:
+                                    error_data = await del_resp.json()
+                                    error_message += f"\nDetails: {error_data.get('message', 'Unknown error')}"
+                                except ValueError:
+                                    error_message += f"\nDetails: HTTP {del_resp.status} - {del_response_text}"
+                                await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                                return
+                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Number not found in your account**", parse_mode=ParseMode.MARKDOWN)
+        except aiohttp.ClientError as e:
+            LOGGER.error(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - Network error during delete_number for user_id {user_id}: {str(e)}")
+            await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Network error while deleting number. Please try again.**", parse_mode=ParseMode.MARKDOWN)
 
 @bot.on_message(filters.command("get"))
 @restrict_to_authorized
@@ -514,23 +623,35 @@ async def get_otp(client, message: Message):
     url = f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json?PageSize=10"
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Failed to fetch messages**", parse_mode=ParseMode.MARKDOWN)
-                return
+        try:
+            async with session.get(url, headers=headers) as resp:
+                response_text = await resp.text()
+                LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Fetch OTP messages API response for user_id {user_id}: Status {resp.status}, Response {response_text}")
+                if resp.status != 200:
+                    error_message = f"**✘《 Error ↯ 》 Failed to fetch messages.**\nDetails: HTTP {resp.status}"
+                    try:
+                        error_data = await resp.json()
+                        error_message += f" - {error_data.get('message', 'Unknown error')}"
+                    except ValueError:
+                        error_message += f" - {response_text}"
+                    await client.edit_message_text(message.chat.id, loading_message.id, error_message, parse_mode=ParseMode.MARKDOWN)
+                    return
 
-            data = await resp.json()
-            messages = data.get("messages", [])
-            if not messages:
-                await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 No messages found**", parse_mode=ParseMode.MARKDOWN)
-                return
+                data = await resp.json()
+                messages = data.get("messages", [])
+                if not messages:
+                    await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 No messages found**", parse_mode=ParseMode.MARKDOWN)
+                    return
 
-            text = "**Latest OTP Messages:**\n\n"
-            for msg in messages:
-                if msg.get("direction") == "inbound":
-                    text += f"{msg.get('from')} -> {msg.get('body')}\n"
+                text = "**Latest OTP Messages:**\n\n"
+                for msg in messages:
+                    if msg.get("direction") == "inbound":
+                        text += f"{msg.get('from')} -> {msg.get('body')}\n"
 
-            await client.edit_message_text(message.chat.id, loading_message.id, text or "**✘《 Error ↯ 》 No OTPs found**", parse_mode=ParseMode.MARKDOWN)
+                await client.edit_message_text(message.chat.id, loading_message.id, text or "**✘《 Error ↯ 》 No OTPs found**", parse_mode=ParseMode.MARKDOWN)
+        except aiohttp.ClientError as e:
+            LOGGER.error(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - ERROR - Network error during get_otp for user_id {user_id}: {str(e)}")
+            await client.edit_message_text(message.chat.id, loading_message.id, "**✘《 Error ↯ 》 Network error while fetching OTPs. Please try again.**", parse_mode=ParseMode.MARKDOWN)
 
 LOGGER.info(f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - INFO - Bot Successfully Started! 💥")
 bot.run()
